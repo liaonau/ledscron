@@ -38,35 +38,38 @@ gpointer listener(gpointer data)
 {
     GDBusConnection* connection = (GDBusConnection*)data;
     int x11_fd = ConnectionNumber(display);
-
-    fd_set   in_fds;
-    struct   timeval tv;
     XkbEvent ev;
+
+    fd_set fds;
+    struct timeval tv = {.tv_sec = 0, .tv_usec = 1};
+
     while (1)
     {
+        FD_ZERO(&fds);
+        FD_SET(x11_fd, &fds);
+
+        int num_ready_fds = select(x11_fd + 1, &fds, NULL, NULL, &tv);
+        if (num_ready_fds < 0)
+            fatal("an error on select");
+        /*else if (num_ready_fds == 0)*/
+            /*printf("timer\n");*/
+
         while (XPending(display))
-            XNextEvent(display, &ev.core);
-
-        FD_ZERO(&in_fds);
-        FD_SET(x11_fd, &in_fds);
-        tv.tv_usec = 0;
-        tv.tv_sec  = SLEEP_SECS;
-
-        int num_ready_fds = select(x11_fd + 1, &in_fds, NULL, NULL, &tv);
-        if (num_ready_fds > 0)
         {
+            XNextEvent(display, &ev.core);
             if (ev.type == xkb_event_base && ev.any.xkb_type == XkbIndicatorStateNotify)
             {
+                unsigned int s;
+                XkbGetIndicatorState(display, XkbUseCoreKbd, &s);
                 GError *er = NULL;
                 g_dbus_connection_emit_signal(connection, NULL, OBJECT_PATH, INTERFACE_NAME, SIGNAL_NAME,
                         g_variant_new("(u)", ev.indicators.state), &er);
                 g_assert_no_error(er);
             }
         }
-        /*else if (num_ready_fds == 0)*/
-            /*printf("timer\n");*/
-        else if (num_ready_fds < 0)
-            fatal("an error on select");
+
+        tv.tv_usec = 0;
+        tv.tv_sec  = SLEEP_SECS;
     }
     return NULL;
 }
