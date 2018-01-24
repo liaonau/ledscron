@@ -2,10 +2,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <X11/XKBlib.h>
+#include <sys/select.h>
 
 #define OBJECT_PATH    "/com/github/liaonau/"NAME
 #define INTERFACE_NAME "com.github.liaonau."NAME
+#define METHOD_NAME    "Get"
 #define SIGNAL_NAME    "Changed"
+
+#define SLEEP_SECS 5
 
 static Display  *display  = NULL;
 static int xkb_event_base = 0;
@@ -18,6 +22,9 @@ static const gchar introspection_xml[] =
 "        <signal name='"SIGNAL_NAME"'>"
 "            <arg type='u' name='mods' direction='out'/>"
 "        </signal>"
+"        <method name='"METHOD_NAME"'>"
+"            <arg type='u' name='mods' direction='out'/>"
+"        </method>"
 "    </interface>"
 "</node>";
 
@@ -27,7 +34,54 @@ static void fatal(const char *message)
     exit(EXIT_FAILURE);
 }
 
-static const GDBusInterfaceVTable iface_vtable = { NULL, NULL, NULL, {NULL}, };
+gpointer listener(gpointer data)
+{
+    GDBusConnection* connection = (GDBusConnection*)data;
+    int x11_fd = ConnectionNumber(display);
+
+    fd_set   in_fds;
+    struct   timeval tv;
+    XkbEvent ev;
+    while (1)
+    {
+        while (XPending(display))
+            XNextEvent(display, &ev.core);
+
+        FD_ZERO(&in_fds);
+        FD_SET(x11_fd, &in_fds);
+        tv.tv_usec = 0;
+        tv.tv_sec  = SLEEP_SECS;
+
+        int num_ready_fds = select(x11_fd + 1, &in_fds, NULL, NULL, &tv);
+        if (num_ready_fds > 0)
+        {
+            if (ev.type == xkb_event_base && ev.any.xkb_type == XkbIndicatorStateNotify)
+            {
+                GError *er = NULL;
+                g_dbus_connection_emit_signal(connection, NULL, OBJECT_PATH, INTERFACE_NAME, SIGNAL_NAME,
+                        g_variant_new("(u)", ev.indicators.state), &er);
+                g_assert_no_error(er);
+            }
+        }
+        /*else if (num_ready_fds == 0)*/
+            /*printf("timer\n");*/
+        else if (num_ready_fds < 0)
+            fatal("an error on select");
+    }
+    return NULL;
+}
+
+static void method_handler(GDBusConnection *connection, const gchar *sender, const gchar *object_path, const gchar *interface_name,
+        const gchar *method_name, GVariant *parameters, GDBusMethodInvocation *invocation, gpointer user_data)
+{
+    if (g_strcmp0(method_name, METHOD_NAME) != 0)
+        return;
+    unsigned int state;
+    if (XkbGetIndicatorState(display, XkbUseCoreKbd, &state) != Success)
+        fatal("error reading indicators state");
+    g_dbus_method_invocation_return_value(invocation, g_variant_new("(u)", state));
+}
+static const GDBusInterfaceVTable iface_vtable = { method_handler, NULL, NULL, {NULL}, };
 static void on_bus_acquired(GDBusConnection *connection, const gchar *name, gpointer user_data)
 {
     guint id = g_dbus_connection_register_object(connection, OBJECT_PATH, introspection_data->interfaces[0], &iface_vtable, NULL, NULL, NULL);
@@ -35,42 +89,17 @@ static void on_bus_acquired(GDBusConnection *connection, const gchar *name, gpoi
 }
 static void on_name_acquired(GDBusConnection *connection, const gchar *name, gpointer user_data)
 {
-    XkbEvent ev;
-    while (1)
-    {
-        XNextEvent(display, &ev.core);
-        if (ev.type == xkb_event_base && ev.any.xkb_type == XkbIndicatorStateNotify)
-        {
-            unsigned int state = ev.indicators.state;
-            GError *er = NULL;
-            g_dbus_connection_emit_signal(connection, NULL, OBJECT_PATH, INTERFACE_NAME, SIGNAL_NAME, g_variant_new("(u)", state), &er);
-            g_assert_no_error(er);
-        }
-    }
+    g_thread_new(NULL, listener, connection);
 }
 static void on_name_lost(GDBusConnection *connection, const gchar *name, gpointer user_data)
 {
-    fatal("lost name on bus");
+    fatal(NAME" lost name on bus");
 }
 
-static void start_dbus(void)
+int main(int argc, char *argv[])
 {
-    introspection_data = g_dbus_node_info_new_for_xml(introspection_xml, NULL);
-    g_assert(introspection_data != NULL);
-
-    int type  = G_BUS_TYPE_SESSION;
-    int flags = G_BUS_NAME_OWNER_FLAGS_NONE;
-    gint id   = g_bus_own_name(type, INTERFACE_NAME, flags, on_bus_acquired, on_name_acquired, on_name_lost, NULL, NULL);
-
-    GMainLoop* loop = g_main_loop_new(NULL, FALSE);
-    g_main_loop_run(loop);
-
-    //We'll never reach here.
-    g_bus_unown_name(id);
-    g_dbus_node_info_unref(introspection_data);
-}
-static void init_display(void)
-{
+    if (!XInitThreads())
+        fatal("cannot initialize X threads");
     int maj = XkbMajorVersion;
     int min = XkbMinorVersion;
     int opcode;
@@ -84,13 +113,20 @@ static void init_display(void)
         fatal("XkbQueryExtension error");
     if (!XkbSelectEvents(display, XkbUseCoreKbd, XkbIndicatorStateNotifyMask, XkbIndicatorStateNotifyMask))
         fatal("XkbSelectEvents error");
-}
 
-int main(int argc, char *argv[])
-{
-    init_display();
-    start_dbus();
+    introspection_data = g_dbus_node_info_new_for_xml(introspection_xml, NULL);
+    g_assert(introspection_data != NULL);
 
+    int type  = G_BUS_TYPE_SESSION;
+    int flags = G_BUS_NAME_OWNER_FLAGS_NONE;
+    gint id   = g_bus_own_name(type, INTERFACE_NAME, flags, on_bus_acquired, on_name_acquired, on_name_lost, NULL, NULL);
+
+    GMainLoop* loop = g_main_loop_new(NULL, FALSE);
+    g_main_loop_run(loop);
+
+    //We'll never reach here.
+    g_bus_unown_name(id);
+    g_dbus_node_info_unref(introspection_data);
     XCloseDisplay(display);
     return EXIT_SUCCESS;
 }
